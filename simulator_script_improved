@@ -1,0 +1,337 @@
+#!/bin/bash
+# ==============================================================================
+# Dakota Driver Script for OpenFOAM (Improved Version)
+# Usage: ./simulator_script params.in results.out
+# 
+# Improvements:
+#   - Dynamic NPROCS with decomposeParDict modification
+#   - Timeout protection
+#   - Disk space check
+#   - Symbolic links for static data
+#   - Robust error handling
+# ==============================================================================
+
+# Catch unexpected errors
+set -e
+
+# -----------------------------------------------------------
+# CONFIGURATION (Environment Variables with Defaults)
+# -----------------------------------------------------------
+params=$1
+results=$2
+
+# Number of processors: set via environment or default to 8
+NPROCS=${NPROCS:-12}
+
+# Timeout in seconds (1 hour default)
+TIMEOUT_SEC=${TIMEOUT_SEC:-36000}
+
+# Minimum required disk space in GB
+REQUIRED_GB=${REQUIRED_GB:-5}
+
+echo "============================================================"
+echo "Starting Simulation in $(pwd)"
+echo "Using $NPROCS processors, timeout: ${TIMEOUT_SEC}s"
+echo "============================================================"
+
+# -----------------------------------------------------------
+# 0. PRE-FLIGHT CHECKS
+# -----------------------------------------------------------
+
+# A. Disk space check
+AVAILABLE_GB=$(df -BG . | tail -1 | awk '{print int($4)}')
+if [ "$AVAILABLE_GB" -lt "$REQUIRED_GB" ]; then
+    echo "ERROR: Insufficient disk space: ${AVAILABLE_GB}GB < ${REQUIRED_GB}GB"
+    echo "1.0e9" > $results
+    exit 0
+fi
+
+# -----------------------------------------------------------
+# 1. SETUP & PRE-PROCESSING
+# -----------------------------------------------------------
+
+# A. Copy/link static files from casebase
+#    Use symbolic links for heavy static data (mesh) to save disk I/O
+#    Copy only what needs to be modified
+if [ -d "../casebase/constant" ]; then
+    ln -sf ../casebase/constant .
+fi
+
+cp -r ../casebase/0 .
+cp -r ../casebase/system .
+
+# B. Copy required Python scripts and directories (with existence checks)
+for item in resultados; do
+    if [ -d "../casebase/$item" ]; then
+        cp -r "../casebase/$item" .
+    else
+        echo "WARNING: Directory ../casebase/$item not found"
+    fi
+done
+
+for script in config.py compute_error.py probes.py imagens.py plot_residuals.gp plot_residuals2.gp; do
+    if [ -f "../casebase/$script" ]; then
+        cp "../casebase/$script" .
+    else
+        echo "WARNING: Script ../casebase/$script not found"
+    fi
+done
+
+# -----------------------------------------------------------
+# 1.1 CHECK IF SIMULATION ALREADY RAN
+# -----------------------------------------------------------
+# A simulation is considered complete if:
+#   - log.scalarFoam exists (final solver ran)
+#   - Time directory 10000 exists (final time reached)
+#   - No FAILED_RUN marker from previous attempt
+
+SIMULATION_ALREADY_RAN=false
+
+if [ -f "log.scalarFoam" ] && [ -d "10000" ] && [ ! -f "FAILED_RUN" ]; then
+    echo "============================================================"
+    echo "SIMULATION ALREADY COMPLETED - Skipping OpenFOAM solvers"
+    echo "============================================================"
+    echo "Found: log.scalarFoam and time directory 10000"
+    SIMULATION_ALREADY_RAN=true
+elif [ -f "log.simpleFoam" ] && [ -d "5000" ] && [ ! -f "FAILED_RUN" ]; then
+    echo "============================================================"
+    echo "PARTIAL SIMULATION DETECTED - simpleFoam completed"
+    echo "Will continue from scalarFoam..."
+    echo "============================================================"
+    SIMULATION_ALREADY_RAN="partial"
+fi
+
+# Only perform setup if simulation hasn't run or failed previously
+if [ "$SIMULATION_ALREADY_RAN" = false ]; then
+    # B. Dynamically update decomposeParDict with NPROCS
+    #    This ensures the decomposition matches the mpirun -np value
+    if [ -f "system/decomposeParDict" ]; then
+        echo "Updating decomposeParDict to use $NPROCS subdomains..."
+        sed -i "s/^numberOfSubdomains.*/numberOfSubdomains $NPROCS;/" system/decomposeParDict
+        
+        # Also update the simple/hierarchical coefficients if needed
+        # For simple decomposition: calculate n=(NPROCS, 1, 1) or similar
+        # This example assumes simple decomposition with all procs in x-direction
+        sed -i "s/^\s*n\s*(.*);/    n ($NPROCS 1 1);/" system/decomposeParDict
+    else
+        echo "WARNING: decomposeParDict not found, using existing configuration."
+    fi
+
+    # C. Generate dynamic files from templates using Dakota preprocessor
+    dprepro $params input.template input.txt 2>/dev/null || true
+    dprepro $params U.template 0/U 2>/dev/null || true
+
+    # D. Prepare for Parallel Execution
+    echo "Decomposing domain with $NPROCS processors..."
+    decomposePar > log.decomposePar 2>&1
+fi
+
+# -----------------------------------------------------------
+# 2. RUN SOLVERS (Skip if already completed)
+# -----------------------------------------------------------
+
+# Variable to store current gnuplot PID
+GNUPLOT_PID=""
+
+# Function to start a specific gnuplot script in background (with 60s delay)
+start_gnuplot() {
+    local script=$1
+    echo "Starting gnuplot: $script (after 60s delay)..."
+    
+    # Only start if we have a display (not headless)
+    if [ -n "$DISPLAY" ]; then
+        if [ -f "$script" ]; then
+            # Start gnuplot after 60 second delay in background
+            (sleep 60 && gnuplot "$script") &
+            GNUPLOT_PID=$!
+            echo "  -> Will start $script in 60s (PID: $GNUPLOT_PID)"
+        else
+            echo "  -> Script $script not found"
+        fi
+    else
+        echo "  -> No DISPLAY available, skipping gnuplot visualization"
+    fi
+}
+
+# Function to stop the current gnuplot process
+stop_gnuplot() {
+    if [ -n "$GNUPLOT_PID" ]; then
+        if kill -0 "$GNUPLOT_PID" 2>/dev/null; then
+            kill "$GNUPLOT_PID" 2>/dev/null
+            echo "  -> Stopped gnuplot (PID: $GNUPLOT_PID)"
+        fi
+        GNUPLOT_PID=""
+    fi
+}
+
+# Helper function for running solvers with timeout and error handling
+run_solver() {
+    local solver=$1
+    local logfile=$2
+    
+    echo "Running $solver (Parallel, $NPROCS cores)..."
+    
+    if timeout $TIMEOUT_SEC mpirun -np $NPROCS $solver -parallel > $logfile 2>&1; then
+        echo "$solver finished successfully."
+        return 0
+    else
+        local exit_code=$?
+        if [ $exit_code -eq 124 ]; then
+            echo "$solver TIMED OUT after ${TIMEOUT_SEC}s."
+        else
+            echo "$solver CRASHED with exit code $exit_code."
+        fi
+        return 1
+    fi
+}
+
+# --- STEP 1: simpleFoam (0 to 5000) ---
+# Skip if simulation already ran (full or partial)
+if [ "$SIMULATION_ALREADY_RAN" = false ]; then
+    sed -i 's/^endTime.*/endTime 5000;/' system/controlDict
+    sed -i 's/^writeInterval.*/writeInterval 1000;/' system/controlDict
+
+    # Start plot_residuals.gp for simpleFoam
+    start_gnuplot plot_residuals.gp
+
+    if ! run_solver simpleFoam log.simpleFoam; then
+        touch FAILED_RUN
+    fi
+
+    # Stop plot_residuals.gp after simpleFoam completes
+    stop_gnuplot
+
+    # Reconstruct and prepare for next solver
+    if [ ! -f FAILED_RUN ]; then
+        reconstructPar -latestTime > log.reconstructPar1 2>&1
+        rm -rf processor*
+        
+        # Copy scalar fields to latest time directory
+        latest=$(ls -1d [0-9]* 2>/dev/null | sort -n | tail -1)
+        if [ -n "$latest" ] && [ -d "0" ]; then
+            cp 0/c* "$latest/" 2>/dev/null || true
+        fi
+        
+        # Re-decompose for next solver
+        decomposePar -latestTime > log.decomposePar2 2>&1
+    fi
+else
+    echo "Skipping simpleFoam (already completed)"
+fi
+
+# --- STEP 2: scalarFoam (5000 to 10000) ---
+# Skip only if FULL simulation already ran (not partial)
+if [ "$SIMULATION_ALREADY_RAN" != true ] && [ ! -f FAILED_RUN ]; then
+    # For partial runs, we need to re-decompose before scalarFoam
+    if [ "$SIMULATION_ALREADY_RAN" = "partial" ]; then
+        echo "Resuming from partial run - preparing for scalarFoam..."
+        decomposePar -latestTime > log.decomposePar2 2>&1
+    fi
+    
+    sed -i 's/^endTime.*/endTime 10000;/' system/controlDict
+
+    # Start plot_residuals2.gp for scalarFoam
+    start_gnuplot plot_residuals2.gp
+    
+    if ! run_solver scalarFoam log.scalarFoam; then
+        touch FAILED_RUN
+    fi
+
+    # Stop plot_residuals2.gp after scalarFoam completes
+    stop_gnuplot
+    
+    # Reconstruct after scalarFoam
+    if [ ! -f FAILED_RUN ]; then
+        echo "Reconstructing mesh and fields..."
+        reconstructPar -latestTime > log.reconstructPar2 2>&1
+        rm -rf processor*
+    fi
+else
+    if [ "$SIMULATION_ALREADY_RAN" = true ]; then
+        echo "Skipping scalarFoam (already completed)"
+    fi
+fi
+
+# -----------------------------------------------------------
+# 3. POST-PROCESSING & RESULT EXTRACTION (Run if simulation completed)
+# -----------------------------------------------------------
+
+# Check if simulation is in a valid completed state
+# Either: already ran successfully before OR just finished without failure
+if [ "$SIMULATION_ALREADY_RAN" = true ] || [ ! -f FAILED_RUN ]; then
+    echo "============================================================"
+    echo "Running Python post-processing scripts..."
+    echo "============================================================"
+
+    # Run compute_error.py to generate results
+    echo "Calculating error..."
+    if python compute_error.py; then
+        # Success: Copy result to Dakota
+        if [ -s "resultados/total_error.txt" ]; then
+            cat resultados/total_error.txt > $results
+            echo "Objective value: $(cat $results)"
+        else
+            echo "Python ran but produced empty file."
+            touch FAILED_RUN
+        fi
+    else
+        PYTHON_EXIT=$?
+        echo "Python script failed with exit code $PYTHON_EXIT."
+        touch FAILED_RUN
+    fi
+
+    # -----------------------------------------------------------
+    # 4. POST-PROCESSING VISUALIZATION (Run if simulation completed)
+    # -----------------------------------------------------------
+
+    echo "Running post-processing visualization..."
+
+    # probes.py: Extract probe data from results
+    if [ -f "probes.py" ]; then
+        echo "Running probes.py..."
+        if ! timeout 300 python probes.py > log.probes 2>&1; then
+            echo "WARNING: probes.py failed or timed out (non-fatal)"
+        fi
+    fi
+
+    # imagens.py: Generate visualization images using ParaView
+    if [ -f "imagens.py" ]; then
+        echo "Running imagens.py with pvbatch..."
+        if ! timeout 600 /home/rodolfo/ParaView-6.0.1/bin/pvbatch imagens.py > log.imagens 2>&1; then
+            echo "WARNING: imagens.py failed or timed out (non-fatal)"
+        fi
+    fi
+else
+    echo "Simulation not completed - skipping Python post-processing"
+fi
+
+# -----------------------------------------------------------
+# 5. FAILURE HANDLING (Penalty Value)
+# -----------------------------------------------------------
+
+if [ -f FAILED_RUN ]; then
+    echo "============================================================"
+    echo "Simulation FAILED. Assigning Penalty Value."
+    echo "============================================================"
+    
+    # Write a penalty value to results.out
+    # 1.0e9 is a standard "Big Bad Number" for minimization
+    echo "1.0e9" > $results
+fi
+
+# -----------------------------------------------------------
+# 6. CLEANUP
+# -----------------------------------------------------------
+echo "Cleaning up..."
+
+# Remove processor directories
+rm -rf processor*
+
+# Optional: Remove intermediate time directories to save space
+# Uncomment if you don't need them for debugging
+# find . -maxdepth 1 -type d -regex '\./[0-9]+' | sort -n | head -n -1 | xargs rm -rf 2>/dev/null || true
+
+echo "============================================================"
+echo "Done. Result: $(cat $results)"
+echo "============================================================"
+

@@ -1,0 +1,86 @@
+# Usage:
+#   dakota -i dakota_of.in -o run.out > stdout.out
+
+
+# -----------------------------------------------------------
+environment
+    top_method_pointer = 'soga_method'
+    tabular_data
+    tabular_data_file = 'table_out.dat'
+    error_file = 'dakota.err'
+    read_restart = 'dakota3.rst'
+    write_restart = 'dakota4.rst'
+    results_output
+      text
+      results_output_file 'my_results'
+# -----------------------------------------------------------
+
+
+# -----------------------------------------------------------
+method
+  id_method = 'soga_method'
+  soga
+
+    replacement_type
+      elitist
+
+    convergence_type
+      best_fitness_tracker
+        percent_change = 0.1
+
+    max_iterations = 10
+
+    max_function_evaluations = 1000
+
+    population_size = 50
+
+    crossover_type shuffle_random
+      num_offspring = 2 num_parents = 2
+      crossover_rate = 0.8
+
+    mutation_type replace_uniform
+      mutation_rate = 0.1
+
+    seed = 1234
+
+
+# -----------------------------------------------------------
+
+# -----------------------------------------------------------
+# VARIABLES
+# -----------------------------------------------------------
+variables
+  continuous_design = 9
+    # Compact format is cleaner for high-dim variables
+    initial_point  0.55 0.55 0.55 0.55 0.55 0.55 0.55 0.55 0.55
+    lower_bounds   0.1 0.1 0.1 0.1 0.1 0.1 0.1 0.1 0.1
+    upper_bounds   1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0
+    descriptors    'x1'  'x2'  'x3'  'x4'  'x5'  'x6'  'x7'  'x8'  'x9'
+
+# -----------------------------------------------------------
+# INTERFACE
+# -----------------------------------------------------------
+interface
+  fork
+
+    analysis_driver = 'simulator_script_improved' # Use ./ to be safe on Linux
+    parameters_file = 'params.in'
+    results_file    = 'results.out'
+
+    work_directory
+      named 'workdir'
+      directory_tag
+      directory_save
+      file_tag
+      # Expert Tip: Use 'link_files' for heavy static meshes to save disk I/O
+      # Use 'copy_files' for things that change or small templates
+      copy_files = 'templatedir/*'
+
+    # PERFORMANCE BOOST
+    asynchronous
+      evaluation_concurrency = 1
+
+responses
+  objective_functions = 1
+  no_gradients
+  no_hessians
